@@ -108,13 +108,10 @@ class SquadDataset(torch.utils.data.Dataset):
 
 def train(gpu, args):
     args.gpu = gpu
+    device   = gpu
     # rank calculation for each process per gpu so that they can be identified uniquely.
     rank = args.local_ranks * args.ngpus + gpu
-    print('rank:',rank)
-
-
-    # set the gpu for each processes
-    torch.cuda.set_device(args.gpu)
+    print('rank:', rank)
 
     train_encodings, val_encodings = get_squad_encodings(squad_path)
     train_dataset = SquadDataset(train_encodings)
@@ -129,12 +126,12 @@ def train(gpu, args):
         train_dataset,
         batch_size  = BATCH_SIZE,
         shuffle     = (train_sampler is None),
-        num_workers = 4,
+        num_workers = 0,
         sampler     = train_sampler,
     )
 
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29500'
+    #os.environ['MASTER_ADDR'] = 'localhost'
+    #os.environ['MASTER_PORT'] = '56070'
     # Boilerplate code to initialize the parallel prccess.
     # It looks for ip-address and port which we have set as environ variable.
     # If you don't want to set it in the main then you can pass it by replacing
@@ -155,8 +152,8 @@ def train(gpu, args):
     # Then it will progress from there.
 
     model = BertForQuestionAnswering.from_pretrained(
-        "bert-base-uncased", # Use the 12-layer BERT model, with an uncased vocab.
-        #"bert-large-uncased", # Use the 12-layer BERT model, with an uncased vocab.
+        #"bert-base-uncased", # Use the 12-layer BERT model, with an uncased vocab.
+        "bert-large-uncased", # Use the 12-layer BERT model, with an uncased vocab.
     )
     model = model.cuda(args.gpu)
     model = torch.nn.parallel.DistributedDataParallel(
@@ -164,7 +161,6 @@ def train(gpu, args):
 
     # create an optimizer object
     optim = AdamW(model.parameters(), lr=5e-5)
-
 
     for epoch in range(3):
         print('epoch ', epoch)
@@ -192,8 +188,9 @@ if __name__ == '__main__':
 
     args.world_size           = args.ngpus * args.nodes
     os.environ['WORLD_SIZE']  = str(args.world_size)
-    #os.environ['MASTER_ADDR'] = 'localhost'
-    #os.environ['MASTER_PORT'] = '12355'
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '56070'
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
-    #mp.spawn(train, nprocs=args.ngpus, args=(args,))
     mp.spawn(train, nprocs=args.ngpus, args=(args,), join=True)
+    #train(0, args)
