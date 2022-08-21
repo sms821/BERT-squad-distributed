@@ -22,7 +22,7 @@ from transformers import BertTokenizer, BertTokenizerFast
 sys.path.append('/home/cc/DS-Analyzer/tool')
 from profiler_utils import DataStallProfiler
 
-squad_path = './data/squad/v2.0'
+squad_path = '/home/cc/BERT-squad-distributed/examples/pytorch/data/squad/v2.0'
 
 parser = argparse.ArgumentParser(description='PyTorch BERT')
 
@@ -76,6 +76,7 @@ parser.add_argument('--amp',action='store_true',help='Run model AMP (automatic m
 parser.add_argument("--nnodes", default=1, type=int)
 parser.add_argument("--node_rank", default=0, type=int)
 parser.add_argument("--delay_allreduce", default=True, type=bool)
+parser.add_argument("--data", default='', type=str)
 
 #profiler
 parser.add_argument('--data-profile', action='store_true', default=True,
@@ -89,6 +90,9 @@ parser.add_argument('--num_minibatches', type=int, default=50)
 parser.add_argument("--precreate", action='store_true',
                         help="Precreated tensors loaded from file")
 parser.add_argument("--full_epoch", action='store_true', default=False)
+parser.add_argument("--classes", default=1000, type=int)
+parser.add_argument("--arch", default=None, type=str)
+
 
 cudnn.benchmark = True
 
@@ -97,11 +101,11 @@ args = parser.parse_args()
 if args.data_profile:
     args.dprof = DataStallProfiler(args)
 
-BATCH_SIZE = 4
-args.world_size    = args.nnodes
-os.environ['WORLD_SIZE']  = str(args.world_size)
-os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '56070'
+BATCH_SIZE = args.batch_size
+#args.world_size    = args.nnodes
+#os.environ['WORLD_SIZE']  = str(args.world_size)
+#os.environ['MASTER_ADDR'] = 'localhost'
+#os.environ['MASTER_PORT'] = '56070'
 
 args.distributed = False
 if 'WORLD_SIZE' in os.environ:
@@ -239,12 +243,12 @@ def train():
     # More useful information can be found in
     # https://yangkky.github.io/2019/07/08/distributed-pytorch-tutorial.html
 
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',
-        world_size=args.world_size,
-        rank=rank
-    )
+    #dist.init_process_group(
+    #    backend='nccl',
+    #    init_method='env://',
+    #    world_size=args.world_size,
+    #    rank=rank
+    #)
     torch.manual_seed(0)
     # start from the same randomness in different nodes. If you don't set it
     # then networks can have different weights in different nodes when the
