@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import math
 from tqdm import tqdm
 from pathlib import Path
 
@@ -98,6 +99,8 @@ cudnn.benchmark = True
 
 args = parser.parse_args()
 
+#profile mode
+#redirect all output to a log file
 if args.data_profile:
     args.dprof = DataStallProfiler(args)
 
@@ -117,6 +120,24 @@ compute_time_list = []
 data_time_list = []
 fwd_prop_time_list = []
 bwd_prop_time_list = []
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
 
 def read_squad(path):
@@ -209,76 +230,90 @@ class SquadDataset(torch.utils.data.Dataset):
 
 #print('num batches ', len(train_loader))
 
-def train():
-#    args.gpu = gpu
+def train(train_loader, model, optim, epoch):
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    end = time.time()
+    args.dprof.start_data_tick()
+    dataset_time = compute_time = 0
     device   = args.gpu
-    # rank calculation for each process per gpu so that they can be identified uniquely.
-    #rank = args.local_ranks * args.ngpus + gpu
-    rank = args.local_rank
-    print('rank:', args.local_rank)
+    
+    for i, batch in enumerate(tqdm(train_loader)):
+        optim.zero_grad()
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        start_positions = batch['start_positions'].to(device)
+        end_positions = batch['end_positions'].to(device)
 
-    train_encodings, val_encodings = get_squad_encodings(squad_path)
-    train_dataset = SquadDataset(train_encodings)
-    val_dataset   = SquadDataset(val_encodings)
+        # measure data loading time
+        data_time.update(time.time() - end)
+        dataset_time += (time.time() - end)
+        compute_start = time.time()
 
-    # Ensures that each process gets differnt data from the batch.
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset, num_replicas=args.world_size, rank=args.local_rank
-    )
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size  = BATCH_SIZE,
-        shuffle     = (train_sampler is None),
-        num_workers = 0,
-        sampler     = train_sampler,
-    )
+        #-----------------Stop data, start compute------#
+        #if profiling, sync here
+        if args.data_profile:
+            torch.cuda.synchronize()
+            args.dprof.stop_data_tick()
+            args.dprof.start_compute_tick()
+        #-----------------------------------------------#
 
-    #os.environ['MASTER_ADDR'] = 'localhost'
-    #os.environ['MASTER_PORT'] = '56070'
-    # Boilerplate code to initialize the parallel prccess.
-    # It looks for ip-address and port which we have set as environ variable.
-    # If you don't want to set it in the main then you can pass it by replacing
-    # the init_method as ='tcp://<ip-address>:<port>' after the backend.
-    # More useful information can be found in
-    # https://yangkky.github.io/2019/07/08/distributed-pytorch-tutorial.html
+        outputs = model(input_ids, attention_mask=attention_mask, \
+             start_positions=start_positions, end_positions=end_positions)
 
-    #dist.init_process_group(
-    #    backend='nccl',
-    #    init_method='env://',
-    #    world_size=args.world_size,
-    #    rank=rank
-    #)
-    torch.manual_seed(0)
-    # start from the same randomness in different nodes. If you don't set it
-    # then networks can have different weights in different nodes when the
-    # training starts. We want exact copy of same network in all the nodes.
-    # Then it will progress from there.
+        loss = outputs[0]
 
-    model = BertForQuestionAnswering.from_pretrained(
-        #"bert-base-uncased", # Use the 12-layer BERT model, with an uncased vocab.
-        "bert-large-uncased", # Use the 12-layer BERT model, with an uncased vocab.
-    )
-    model = model.cuda(args.gpu)
-    model = torch.nn.parallel.DistributedDataParallel(
-        model, device_ids=[args.gpu])
+        # compute gradient and do SGD step
+        args.dprof.start_compute_bwd_tick()
 
-    # create an optimizer object
-    optim = AdamW(model.parameters(), lr=5e-5)
+        loss.backward()
 
-    for epoch in range(3):
-        print('epoch ', epoch)
-        for i, batch in enumerate(tqdm(train_loader)):
-            optim.zero_grad()
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            start_positions = batch['start_positions'].to(device)
-            end_positions = batch['end_positions'].to(device)
-            outputs = model(input_ids, attention_mask=attention_mask, \
-                 start_positions=start_positions, end_positions=end_positions)
-            loss = outputs[0]
-            loss.backward()
-            optim.step()
+        args.dprof.start_AR_tick()
+        optim.step()
+        args.dprof.stop_AR_tick()
+
+        torch.cuda.synchronize()
+
+        #-----------------Stop compute, start data------#
+        args.dprof.stop_compute_bwd_tick()
+        args.dprof.stop_compute_tick()
+        args.dprof.start_data_tick()
+        #-----------------------------------------------#
+
+        compute_time += (time.time() - compute_start)
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+
+        end = time.time()
+
+        #train_loader_len = int(math.ceil(train_loader._size / args.batch_size))
+        train_loader_len = int(math.ceil(len(train_loader) / args.batch_size))
+
+        if args.local_rank == 0 and i % args.print_freq == 0 and i > 1:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Speed {3:.3f} ({4:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                   epoch, i, train_loader_len,
+                   args.total_batch_size / batch_time.val,
+                   args.total_batch_size / batch_time.avg,
+                   batch_time=batch_time,
+                   data_time=data_time, loss=losses, top1=top1, top5=top5))
+
+    data_time_list.append(dataset_time)
+    compute_time_list.append(compute_time)
+
+    return batch_time.avg
 
     #model.eval()
 
@@ -301,13 +336,82 @@ def main():
         args.world_size = torch.distributed.get_world_size()
 
     args.total_batch_size = args.world_size * args.batch_size
-    print("train")
+
+    # rank calculation for each process per gpu so that they can be identified uniquely.
+    #rank = args.local_ranks * args.ngpus + gpu
+    rank = args.local_rank
+    print('rank:', args.local_rank)
+
+    train_encodings, val_encodings = get_squad_encodings(squad_path)
+    train_dataset = SquadDataset(train_encodings)
+    val_dataset   = SquadDataset(val_encodings)
+
+    # Ensures that each process gets differnt data from the batch.
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset, num_replicas=args.world_size, rank=args.local_rank
+    )
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size  = args.batch_size,
+        shuffle     = (train_sampler is None),
+        num_workers = 0,
+        sampler     = train_sampler,
+    )
+
+    #os.environ['MASTER_ADDR'] = 'localhost'
+    #os.environ['MASTER_PORT'] = '56070'
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    torch.manual_seed(0)
+    # start from the same randomness in different nodes. If you don't set it
+    # then networks can have different weights in different nodes when the
+    # training starts. We want exact copy of same network in all the nodes.
+    # Then it will progress from there.
+
+    model = BertForQuestionAnswering.from_pretrained(
+        "bert-large-uncased", # Use the 12-layer BERT model, with an uncased vocab.
+    )
+    model = model.cuda(args.gpu)
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, device_ids=[args.gpu])
+
+    # create an optimizer object
+    optim = AdamW(model.parameters(), lr=5e-5)
+
+    total_time = AverageMeter()
+    dur_setup = time.time() - start
+    time_stat.append(dur_setup)
+    print("Batch size for GPU {} is {}, workers={}".format(args.gpu, args.batch_size, args.workers))
+
+    for epoch in range(args.start_epoch, args.epochs):
+        print('epoch ', epoch)
+
+        # log timing
+        start_ep = time.time()
+
+        avg_train_time = train(train_loader, model, optim, epoch)
+
+        total_time.update(avg_train_time)
+
+        dur_ep = time.time() - start_ep
+        print("EPOCH DURATION = {}".format(dur_ep))
+        time_stat.append(dur_ep)
 
 
-#    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    if args.local_rank == 0:
+        for i in time_stat:
+            print("Time_stat : {}".format(i))
 
-    #mp.spawn(train, nprocs=args.ngpus, args=(args,), join=True)
-    train()
+        for i in range(0, len(data_time_list)):
+            print("Data time : {}\t Compute time : {}".format(data_time_list[i], compute_time_list[i]))
+
+    dur_full = time.time() - start_full
+
+    if args.local_rank == 0:
+        print("Total time for all epochs = {}".format(dur_full))
+
+    if args.data_profile:
+        args.dprof.stop_profiler()
 
 
 if __name__ == '__main__':
