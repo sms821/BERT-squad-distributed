@@ -244,6 +244,10 @@ def train(train_loader, model, optim, epoch):
     device   = args.gpu
     
     for i, batch in enumerate(tqdm(train_loader)):
+
+        if i == args.num_minibatches and not args.full_epoch:
+            break
+
         optim.zero_grad()
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
